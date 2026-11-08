@@ -181,6 +181,61 @@ class AntennaConfig:
     #       会炸(+600 dB); 其它角度 |S_a| 已 >=O(0.1), 字面式与稳定式一致.
     gbma_form: str = "auto"
 
+    # 边缘点 phi1se 的解法（见 REPORT A.21）:
+    #   'newton'       : 阻尼牛顿解精确 (B7) —— **默认**, 最稳
+    #   'cubic'        : 三次解(B13近似)做起初值 + 牛顿（精度等价, 略快）
+    #   'cubic_pure'   : 纯三次闭式, 无牛顿 —— 有 (B13) 前提, 宽角/正馈会崩(仅对照)
+    #   'quartic_pure' : 纯四次闭式(无 B13、无迭代) —— 与牛顿同精度, 快 ~5x
+    #   'closed'       : 四次闭式 + 坏点回退牛顿 —— 同一档速度, 多一层保险
+    gbma_phi1se_mode: str = "newton"
+
+    # 馈源分解方式（REPORT A.18 / A.23）:
+    #   'near'     : 在**反射面上**做点匹配（默认；面上场误差 ~2%，端到端峰差 ~+0.2 dB）
+    #   'farfield' : 在**馈源远场方向图**上做点匹配（chou2001 §II，见 gb_farfield_decomp.py）
+    #                参数链 (19)→(15)→(13)，N 是产物；面上场误差 ~7-9%，
+    #                但端到端峰差 0.05~0.27 dB、宽角 10-20° 反而略好
+    gbma_decomp: str = "near"
+    gbma_w_rel: float = 0.40        # 仅 farfield: (19) 窗口内选 w 的位置 [0,1]
+    gbma_cone_margin: float = 1.10  # 仅 farfield: 覆盖锥相对边缘角的余量
+    gbma_ff_basis: str = "paper"    # 仅 farfield: 'paper'=exp(-(kb/2)sin²)(1+cos)/2,
+                                    #             'beam' =exp(-(tanγ/θgb)²)/cosγ
+
+    # 边缘曲率（月牙）修正（REPORT A.24/A.25）——**默认关**
+    #   True  + gbma_form="crescent" : T = ½[1+erf(S_a)] - S_ratio  ← 嫁接式，已不推荐
+    #   **推荐改用下面的 form="analytic"**（纯解析独立路径，REPORT A.27）：
+    #     同一分解下峰值偏差 0.151/0.215 → 0.102/0.130 dB，且反射阶段快 3~4×
+    #     （它不再解 (B7) 的四次方程）。已知限制：θ≳20° 时宽角低 2~7 dB（见 A.27.4）。
+    gbma_edge_crescent: bool = False
+    gbma_crescent_order: int = 1    # 1 足够（实测 order=2 与 order=1 逐位相同）
+
+    # ---- 仅 form="goedge"（GO 反射 + PO 边缘衍射，REPORT A.28）----
+    # gbma_goedge_takenaka: 边缘项写成 Takenaka&Fukumitsu(1982) (25)+(26) 的分支形式
+    #     T_st = E(Z) − (sgn/2)·erfc(sgn·Z)    （几何波 + 边界绕射波）
+    #   False 则用代数恒等的紧致式 ½[1+erf(Z)]；实测相对差 4e-15 ⟹ **数值完全一致**，
+    #   只影响代码写法（True 更贴近论文）。
+    # gbma_goedge_crescent: 是否再叠加「曲边/月牙」修正 S_ratio。
+    #   Takenaka 的典范解是**直线半屏**，我们的边缘是椭圆；实测加了更好
+    #   （12 GHz 峰值偏差：正馈 near 0.148→0.099、偏馈 farfield 0.193→0.030；
+    #     全段 RMS 1.90→0.99）⟹ 默认 True。
+    gbma_goedge_takenaka: bool = True
+    gbma_goedge_crescent: bool = True
+
+    # ---- 额外输出曲线（同一分解/同一馈源功率，另存 .cut）----
+    #   'go'      : 只考虑反射、不做边缘修正 = 论文 L750-753 的 P_r
+    #               （"若 (64) 的鞍点在口径内，则它就是**边缘不存在时**的反射场"）
+    #   'go2'     : 只考虑反射、不做边缘修正，但用 goedge 的 **GO 反射**写法
+    #               （冻结矢量幅度 F0 + 解析远场）= Rieckmann 2002 的"几何波"那一半
+    #   'literal' : 字面式 (74) T*P_r + P_d（含端点项；|S_a|→0 处有奇性，已内部兜底）
+    #   'goedge'  : GO 反射 + PO 边缘衍射（Takenaka erfc 分支式 + 月牙，REPORT A.28）
+    #   'goedge2' : 同上，但用**扁平化**实现（GoEdgeFast），快 ~2×（REPORT A.32）
+    #   'stable' / 'auto' / 'analytic' 也都可以放进来
+    #   每项会在 c.py 的汇总表里多一行，并多写一个 <form>.cut
+    #   注意：'go'/'go2'/'literal' 等与主曲线共用同一次 Ps（边际 ~2 ms）；
+    #         'go2'/'goedge2'/'literal2' 是独立批量调用（~30/~60/~320 ms）；
+    #         'goedge'/'analytic' 各有解器。
+    #   'literal2' = 扁平化的 literal（数值与 literal 等价，实测 8e-16），见 REPORT A.38
+    gbma_extra_forms: tuple = ("go", "go2", "literal", "goedge", "goedge2", "literal2")
+
     # ---- 天线几何 / 电参数 ----
     freq: float = 20e9
     F: float = 0.6
@@ -309,6 +364,16 @@ def _run_impl(cfg: AntennaConfig, report: list):
                 verbose=cfg.verbose,
                 phi_deg=cfg.gbma_phi_deg,
                 form=getattr(cfg, "gbma_form", "auto"),
+                phi1se_mode=getattr(cfg, "gbma_phi1se_mode", "newton"),
+                decomp=getattr(cfg, "gbma_decomp", "near"),
+                w_rel=getattr(cfg, "gbma_w_rel", 0.40),
+                cone_margin=getattr(cfg, "gbma_cone_margin", 1.10),
+                ff_basis=getattr(cfg, "gbma_ff_basis", "paper"),
+                edge_crescent=getattr(cfg, "gbma_edge_crescent", False),
+                crescent_order=getattr(cfg, "gbma_crescent_order", 1),
+                goedge_takenaka=getattr(cfg, "gbma_goedge_takenaka", True),
+                goedge_crescent=getattr(cfg, "gbma_goedge_crescent", True),
+                extra_forms=getattr(cfg, "gbma_extra_forms", ()),
             )
             dt = time.perf_counter() - t0
         except Exception as exc:
@@ -320,9 +385,44 @@ def _run_impl(cfg: AntennaConfig, report: list):
             else:
                 report.append(("GBMA", float(np.max(dBi_gbma)), dt))
                 print(f"GBMA 峰值方向性: {np.max(dBi_gbma):.2f} dBi  ({info['n_beams']} 束, "
-                      f"合成式={info.get('form', '?')}, 耗时 {dt:.2f}s)")
+                      f"合成式={info.get('form', '?')}, "
+                      f"phi1se={info.get('phi1se_mode', '?')}, "
+                      f"分解={info.get('decomp', '?')}, 耗时 {dt:.2f}s)")
+                if getattr(cfg, "gbma_edge_crescent", False) and \
+                        str(getattr(cfg, "gbma_form", "auto")).lower() != "crescent":
+                    print("  注意: gbma_edge_crescent=True 但 gbma_form != 'crescent' —— "
+                          "本次**没有**用上月牙修正（Ps_crescent 需要 form='crescent'）")
+                if str(getattr(cfg, "gbma_form", "auto")).lower() == "goedge":
+                    print(f"  边缘项: Takenaka(25)+(26) "
+                          f"{'✓' if info.get('goedge_takenaka', True) else '✗ 用紧致 erf 式'}，"
+                          f"月牙 {'✓' if info.get('goedge_crescent', True) else '✗'}")
                 save_cut_file("gbma.cut", theta_scan, dBi_gbma, phi_deg=cfg.gbma_phi_deg)
                 saved.append("gbma.cut")
+                # 若主曲线本身就在额外列表里（如 form="literal"），也按它的名字另存一份，
+                # 这样 go.cut / literal.cut 一定都会出现
+                _main_f = str(getattr(cfg, "gbma_form", "auto")).lower()
+                _want = {str(f).lower() for f in (getattr(cfg, "gbma_extra_forms", ()) or ())}
+                if _main_f in _want:
+                    _alias = f"{_main_f}.cut"
+                    save_cut_file(_alias, theta_scan, dBi_gbma, phi_deg=cfg.gbma_phi_deg)
+                    if _alias not in saved:
+                        saved.append(_alias)
+                # 额外合成式：**已在上面的同一次遍历里算好**（REPORT A.30），这里只存盘
+                _ex = info.get("extra_dBi") or {}
+                _t_by = info.get("t_acc_by_form") or {}
+                for _f, dBi_x in _ex.items():
+                    if not np.all(np.isfinite(dBi_x)):
+                        print(f"  额外曲线 form={_f} 含非有限值（已跳过）")
+                        continue
+                    _name = f"{_f}.cut"
+                    save_cut_file(_name, theta_scan, dBi_x, phi_deg=cfg.gbma_phi_deg)
+                    saved.append(_name)
+                    # 各形式**实测**的边际成本：共享 Ps 的（stable/literal/auto/go/...）
+                    # 只有"旋转+活塞+累加"；go2 是独立批量调用，整段都算它的。
+                    _t_m = float(_t_by.get(_f, 0.0))
+                    report.append((_f.upper(), float(np.max(dBi_x)), _t_m))
+                    print(f"  额外曲线 {_f}: → {_name}  (峰值 {np.max(dBi_x):.2f} dBi, "
+                          f"边际 {_t_m*1e3:.1f} ms)")
                 # 用同一馈源模型的数值 PO 做对拍（可选）
                 if cfg.gbma_check_po:
                     S_chk = directions(theta_scan, cfg.gbma_phi_deg)
@@ -372,23 +472,25 @@ if __name__ == "__main__":
 
     # ---------- 1. 算法开关 ----------
     config.run_po = True        # 单点 PO（数值积分）→ PO.cut
+    config.run_po = False       # 单点 PO（数值积分）→ PO.cut
+
     config.run_po_gauss = False   # 多点 Gauss PO（未实现，占位）
     config.run_gbma = True        # GBMA（馈源 GB 展开 → 逐束反射 → 合成）→ gbma.cut
     config.run_gb_po = False      # GB 展开 + 数值 PO（旧路线，占位）
     config.run_paper = False      # 论文第三章法（未实现，占位）
 
     # ---------- 2. 几何 / 电参数 ----------
-    config.freq = 20e9            # 12 GHz
+    config.freq = 50e9            # 12 GHz
     config.D = 1.0                # 口径 1 m
     config.F = 0.6                # 焦距 0.6 m（F/D = 0.6）
-    config.offset_x = 0.0 # 正馈
+    config.offset_x = 0.5# 正馈
     config.offset_y = 0.0
     config.edge_angle_deg = 45.0
     config.edge_taper_db = -12.0
 
     # ---------- 3. 扫描角度 ----------
-    config.theta_scan_deg = (0, 20, 361)
-    config.theta0_max_deg = 40.0  # PO 网格自动公式的扫描上限
+    config.theta_scan_deg = (0, 40, 1601)
+    config.theta0_max_deg = 50.0  # PO 网格自动公式的扫描上限
 
     # ---------- 4. PO 数值积分网格 ----------
     config.po_max_step_lam = 0.5  # 步长上限（λ）。必须 ≤0.5，否则宽角出伪瓣
@@ -414,7 +516,55 @@ if __name__ == "__main__":
     # 合成式：只允许一行生效（stable 默认；literal 仅作对照，且 12 GHz 实测更差）
     config.gbma_form = "stable"    # 默认，生产用
     config.gbma_form = "literal"   # 字面 (74)，仅作对照；会额外打印告警
+    # config.gbma_form = "goedge"    # 默认，生产用
+
+    # 边缘点 phi1se 解法（REPORT A.21）：只允许一行生效
+    #   newton       : 阻尼牛顿解精确 (B7) —— 最稳
+    #   quartic_pure : 解 (B7) 的四次方程（cos=±√(1-sin²) 精确代入，**不做**论文 (B13) 的
+    #                  cos≈1-sin²/2 小角近似）=> 精度与 newton 等同(方向图差 ≤0.05 dB),
+    #                  反射阶段快约 5×
+    #   closed       : 同上 + 坏点回退牛顿（更保险）
+    #   注: cubic_pure 是 (B13) 的**三次近似**版, 要求 sin(phi1se)<1/4; 本工程宽角处
+    #       55~70% 的 (束,方向) 不满足, 正馈会崩(+254 dB), 仅供对照
+    # config.gbma_phi1se_mode = "newton"        # 默认：阻尼牛顿解 (B7)
+    config.gbma_phi1se_mode = "quartic_pure"  # 四次闭式(无 B13)，精度=牛顿，快约 5×
+    # config.gbma_phi1se_mode = "closed"        # 四次闭式 + 坏点回退牛顿
+    # config.gbma_phi1se_mode = "cubic_pure"    # (B13) 三次近似，仅对照
+
+    # 馈源分解方式（REPORT A.18 / A.23）：只允许一行生效
+    #   near     : 反射面上点匹配（默认）—— 面上场误差 ~2%，端到端峰差 +0.15~0.23 dB
+    #   farfield : 馈源远场方向图点匹配（chou2001 §II，gb_farfield_decomp.py）
+    #              N 由 (19)/(15)/(13) 决定（本配置 ≈37），面上场误差 7~9%，
+    #              但端到端峰差 0.05~0.27 dB、10-20° 宽角反而略好
+    # config.gbma_decomp = "near"
+    config.gbma_decomp = "farfield"
+    config.gbma_w_rel = 0.40          # 仅 farfield：(19) 窗口内位置 [0,1]，0=下界
+    config.gbma_cone_margin = 1.10    # 仅 farfield：覆盖锥相对边缘角的余量
+    config.gbma_ff_basis = "paper"    # 仅 farfield：'paper' / 'beam'
 
     config.verbose = False   # True: 完整诊断；False: 只出峰值/耗时表
+
+    # 边缘曲率（月牙）修正（REPORT A.24/A.25）：**嫁接式，已不推荐**
+    #   edge_crescent=True 只是让 Ps 多算一个 Ps_crescent；真正用上它还要 form="crescent"
+    # config.gbma_edge_crescent = True
+    # config.gbma_form = "crescent"
+
+    # 纯解析路径（REPORT A.27）：反射本体(二次型 SPP) + 直边 erf + 月牙级数，
+    #   **不含任何复根求解**（不再解 (B7) 的四次方程）
+    #   实测（θ∈[0,40]/361）：反射阶段 515/580/390/566 ms → 188/144/126/120 ms（3~4×）
+    #   峰值偏差全面变小：正馈near 0.151→0.102，正馈farfield 0.069→0.047，
+    #                    偏馈near 0.215→0.130，偏馈farfield 0.195→0.033
+    #   已知限制：farfield 分解在 θ≳20° 比 PO 低 2~7 dB（宽角端点项缺失，A.27.4）
+    # config.gbma_form = "analytic"
+
+    # GO 反射 + PO 边缘衍射（REPORT A.28）：最快、主瓣/峰值最好
+    #   反射阶段 67~83 ms（stable 371~393）⟹ 约 5×
+    #   峰值偏差：+0.099 / −0.053 / +0.130 / +0.030（四构型）
+    #   边缘项 = Takenaka&Fukumitsu(1982) (25)+(26) 的"几何波 E(Z) + 绕射波 erfc"
+    #     两个开关：gbma_goedge_takenaka（写法，数值不变）、gbma_goedge_crescent（曲率项）
+    #   已知限制：farfield/偏馈 near 的 10–40° 仍不如 stable（1.65/3.70 vs 0.40/2.44）
+    # config.gbma_form = "goedge"
+    # config.gbma_goedge_takenaka = True    # False = 紧致 erf 式（数值相同）
+    # config.gbma_goedge_crescent = False   # False = 纯 Takenaka（无曲边修正）
 
     run_analysis(config)

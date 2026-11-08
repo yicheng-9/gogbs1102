@@ -35,6 +35,8 @@ GBMA (Gaussian Beam Method of Analysis) —— 馈源分解 → 逐束反射 →
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 import gb_single as gs
@@ -144,20 +146,48 @@ class ParabolicReflector:
 class GBBeam:
     """一束 GB 的完整描述(反射点、局部模型、闭式解器、展开系数)"""
 
-    __slots__ = ("O", "L", "dir", "theta", "lm", "beam", "solver", "coef", "inside")
+    __slots__ = ("O", "L", "dir", "theta", "lm", "beam", "solver", "coef", "inside",
+                 "_analytic", "_goedge", "goedge_takenaka", "goedge_crescent")
 
-    def __init__(self, O, L, dir, theta, lm, beam, inside):
+    def __init__(self, O, L, dir, theta, lm, beam, inside,
+                 edge_crescent=False, crescent_order=1,
+                 goedge_takenaka=True, goedge_crescent=True):
         self.O, self.L, self.dir, self.theta = O, L, dir, theta
         self.lm, self.beam, self.inside = lm, beam, inside
-        self.solver = gs.ChouPathakSingle(lm, beam)
+        self.solver = gs.ChouPathakSingle(lm, beam, edge_crescent=edge_crescent,
+                                          crescent_order=crescent_order)
+        self._analytic = None
+        self._goedge = None
+        # goedge 路径的两个选项（REPORT A.28.6/A.28.7），只影响 form="goedge"
+        self.goedge_takenaka = bool(goedge_takenaka)
+        self.goedge_crescent = bool(goedge_crescent)
         self.coef = 1.0 + 0.0j
+
+    @property
+    def analytic(self):
+        """纯解析路径的解器 (REPORT A.27), 首次用到时才建"""
+        if self._analytic is None:
+            self._analytic = gs.ChouPathakAnalytic(self.lm, self.beam, k=self.solver.k)
+        return self._analytic
+
+    @property
+    def goedge(self):
+        """GO 反射 + PO 边缘衍射 (REPORT A.28), 首次用到时才建"""
+        if self._goedge is None:
+            import gb_go_edge as _ge
+            self._goedge = _ge.GoEdgeBeam(self.lm, self.beam, k=self.solver.k,
+                                          takenaka=self.goedge_takenaka,
+                                          crescent=self.goedge_crescent)
+        return self._goedge
 
 
 class FeedGBExpansion:
     """把馈源的照射场展开成一族高斯波束(见模块 docstring)"""
 
     def __init__(self, feed, reflector, n_beams=91, overlap=1.2, theta_fill=1.0,
-                 reg=1e-8, verbose=True):
+                 reg=1e-8, verbose=True, rim_n=1440, rim_fit_n=240, sing_vals=False,
+                 edge_crescent=False, crescent_order=1,
+                 goedge_takenaka=True, goedge_crescent=True):
         self.feed = feed
         self.k = float(feed.k)
         self.refl = reflector
@@ -165,6 +195,18 @@ class FeedGBExpansion:
         self.theta_fill = float(theta_fill)
         self.reg = float(reg)
         self.verbose = verbose
+        # edge_crescent: 给每束的截断因子加"边缘曲率(月牙)"修正 (REPORT A.24/A.25)
+        self.edge_crescent = bool(edge_crescent)
+        self.crescent_order = int(crescent_order)
+        # goedge 路径的两个选项, 只影响 form="goedge" (REPORT A.28.6/A.28.7)
+        self.goedge_takenaka = bool(goedge_takenaka)
+        self.goedge_crescent = bool(goedge_crescent)
+        # rim_n     : 求 theta_extent / 口径内判定用的边缘采样数（要足够密）
+        # rim_fit_n : LocalModelFit 拟合椭圆用的边缘点数（抽稀可省 ~65 ms/91 束）
+        # sing_vals : 是否算点匹配矩阵的奇异值（纯诊断，273×91 的 SVD 约 15 ms）
+        self.rim_n = int(rim_n)
+        self.rim_fit_n = int(rim_fit_n)
+        self.want_sing_vals = bool(sing_vals)
 
         self.W = reflector.focus()
         self.ax = _normalize(reflector.center() - self.W)      # 馈源轴(指向反射面)
@@ -187,7 +229,10 @@ class FeedGBExpansion:
             xp = xg - np.dot(xg, self.ax) * self.ax
         self.x_prime = _normalize(xp)
 
-        self.rim = reflector.rim(1440)
+        self.rim = reflector.rim(self.rim_n)
+        # 拟合用的边缘子集（等间隔抽稀；椭圆拟合对点数不敏感）
+        step = max(1, self.rim_n // max(self.rim_fit_n, 8))
+        self.rim_fit = self.rim[::step]
         self.beams = []
         self.residual = None
 
@@ -244,14 +289,18 @@ class FeedGBExpansion:
             O = self.refl.hit_ray(self.W, d)
             if O is None:
                 continue
-            lm = gs.LocalModelFit(self.refl.parab, O, self.rim, verbose=False)
+            lm = gs.LocalModelFit(self.refl.parab, O, self.rim_fit, verbose=False)
             R = float(np.linalg.norm(O - self.W))
             to_l = np.stack([lm.xhat, lm.yhat, lm.zhat])       # 行 = 局部基(全局分量)
             zi_l = to_l @ _normalize(d)
             pol_l = to_l @ self._h_hat(d)
             beam = gs.GaussianBeam(self.b, R, zi_l, pol_ref=pol_l, k=self.k)
             beams.append(GBBeam(O=O, L=R, dir=_normalize(d), theta=float(th), lm=lm,
-                                beam=beam, inside=bool(self.refl.inside(O))))
+                                beam=beam, inside=bool(self.refl.inside(O)),
+                                edge_crescent=self.edge_crescent,
+                                crescent_order=self.crescent_order,
+                                goedge_takenaka=self.goedge_takenaka,
+                                goedge_crescent=self.goedge_crescent))
         if not beams:
             raise RuntimeError("GBMA: 没有任何束轴与反射面相交")
         self.beams = beams
@@ -306,7 +355,8 @@ class FeedGBExpansion:
             rhs = np.concatenate([rhs, np.zeros(N, dtype=complex)])
         sol, *_ = np.linalg.lstsq(A, rhs, rcond=None)
         self.sol = sol
-        self.sing_vals = np.linalg.svd(A_unit, compute_uv=False)
+        self.sing_vals = (np.linalg.svd(A_unit, compute_uv=False)
+                          if self.want_sing_vals else None)
         for b, c in zip(self.beams, sol):
             b.coef = complex(c)
             b.beam.H0 = c * b.beam.xi_dir.astype(complex)     # 轴上幅度 × 展开系数
@@ -342,6 +392,130 @@ class FeedGBExpansion:
 
 
 # --------------------------------------------------------------------------- #
+# 远场匹配版分解 (chou2001 §II) —— 参考 gb_farfield_decomp.py
+# --------------------------------------------------------------------------- #
+class FarFieldFeedGBExpansion(FeedGBExpansion):
+    """在**馈源远场方向图**上做点匹配的 GB 分解（chou2001 §II，论文推荐做法）。
+
+    与近场版 `FeedGBExpansion` 的差别只有两处：
+
+    * **参数怎么选**：(13)(15)(19) 那条链——(19) 窗口里按 `w_rel` 选光斑 w →
+      (15) 小根解出共焦参数 b → (13) 得角距 Δθ → 六边形格点覆盖锥，**N 是产物**。
+      （近场版反过来：给定束数 N → Δθ → θ_gb → w0 → b。）
+    * **系数怎么定**：在"加密一倍的远场测试格点"上解
+      `Σ_n A_n Ψ_n(∠(ŝ, ŝ_n)) = F_feed(θ)`，再换算到反射点处的入射场幅度
+      `H0_n = A_n·e^{−jkL_n}/(L_n + jb)`（换算的推导见 REPORT A.18；
+      少了 `jb` 会差 ×1.4/+45°，是这一步最容易写错的地方）。
+
+    基函数两支：
+      `basis="paper"` : Ψ = exp[−(kb/2)sin²α]·(1+cosα)/2   —— gb_farfield_decomp 的写法
+      `basis="beam"`  : Ψ = exp[−(tanα/θ_gb)²]/cosα        —— 与本工程 GaussianBeam 的
+                        严格远区渐近极限一致（A.18 数值验证到 1e-6）
+
+    用法与 `FeedGBExpansion` 完全一致（`build()` 之后直接喂 `gbma_far_field`）。
+    """
+
+    def __init__(self, feed, reflector, n_beams=None, w_rel=0.40, cone_margin=1.10,
+                 reg=1e-8, verbose=True, rim_n=1440, rim_fit_n=240, sing_vals=False,
+                 basis="paper", tilt=True, edge_crescent=False, crescent_order=1,
+                 goedge_takenaka=True, goedge_crescent=True):
+        if basis not in ("paper", "beam"):
+            raise ValueError(f"basis 只能是 paper/beam，收到 {basis!r}")
+        # 先按父类把几何/极化/rim 等公共量装好（n_beams 只影响被覆盖的格点参数）
+        super().__init__(feed, reflector, n_beams=(n_beams or 91), overlap=1.2,
+                         theta_fill=1.0, reg=reg, verbose=verbose,
+                         rim_n=rim_n, rim_fit_n=rim_fit_n, sing_vals=sing_vals,
+                         edge_crescent=edge_crescent, crescent_order=crescent_order,
+                         goedge_takenaka=goedge_takenaka,
+                         goedge_crescent=goedge_crescent)
+        import gb_farfield_decomp as gfd
+
+        self.gfd = gfd
+        self.basis = basis
+        self.tilt = bool(tilt)
+        self.w_rel = float(w_rel)
+        self.cone_margin = float(cone_margin)
+        self.n_beams_min = None if n_beams is None else int(n_beams)
+
+        refl_ff = gfd.Reflector(F=reflector.F, D=reflector.D,
+                                offset_x=reflector.ox, offset_y=reflector.oy,
+                                cone_margin=self.cone_margin, n_rim=self.rim_n)
+        feed_ff = gfd.CallableFeed(lambda th: feed.far_field_amplitude(th))
+        self.dec = gfd.decompose(refl_ff, feed_ff, freq=feed.freq, w_rel=self.w_rel,
+                                 tilt=self.tilt, n_beams=self.n_beams_min,
+                                 verbose=False)
+
+        # 用 (13)(15)(19) 的结果覆盖父类按"束数→角距"反推的那套参数
+        self.b = float(self.dec.b)
+        self.w0 = float(np.sqrt(2.0 * self.b / self.k))
+        self.dtheta = float(self.dec.dtheta)
+        self.theta_gb = float(2.0 / (self.k * self.w0))
+        self.theta_cover = float(self.dec.cone_half)
+        self.n_beams = int(self.dec.N)
+        self.K = 0                       # 远场版不是"环数"参数化
+        self.refl_ff = refl_ff
+        if verbose:
+            d = self.dec.info
+            print(f"  [GB 分解(farfield)] N={self._n_beams_str()} "
+                  f"(N(13)={d['n_13']}), cone={np.degrees(self.theta_cover):.2f}°, "
+                  f"Δθ={np.degrees(self.dtheta):.2f}°, θ_gb={np.degrees(self.theta_gb):.2f}°")
+            print(f"             w={d['w']*1e3:.1f} mm (窗口 [{d['w_lo']*1e3:.1f}, "
+                  f"{d['w_hi']*1e3:.1f}] mm, w_rel={self.w_rel:g}), b={self.b*1e3:.1f} mm, "
+                  f"w0={self.w0*1e3:.1f} mm")
+            print(f"             (16)={d['eq16']} (18)={d['eq18']} (19)={d['eq19']}; "
+                  f"LSQ rel={d['lsq_rel']:.2e}, 基函数={self.basis}")
+
+    def _n_beams_str(self):
+        return f"{self.n_beams}" + ("" if not self.dec.info.get("n_override")
+                                    else f"(N/N13={self.dec.info['n_ratio']:.1f})")
+
+    # ---- 格点：馈源远场测试出来的方向 ----
+    def lattice(self):
+        dirs = np.asarray(self.dec.dirs, dtype=float)
+        ths = np.arccos(np.clip(dirs @ self.ax, -1.0, 1.0))
+        return dirs, ths
+
+    # ---- 基函数 ----
+    def _basis_ang(self, cosg):
+        """Ψ(γ)，γ = arccos(cosg)；轴上 Ψ(0)=1。"""
+        if self.basis == "paper":
+            return (np.exp(-(self.k * self.b / 2.0) * (1.0 - cosg ** 2))
+                    * ((1.0 + cosg) / 2.0 if self.tilt else 1.0))
+        gam = np.arccos(np.clip(cosg, -1.0, 1.0))
+        g = np.minimum(gam, 1.2)
+        return np.where(gam < 1.2,
+                        np.exp(-(np.tan(g) / self.theta_gb) ** 2) / np.cos(g), 0.0)
+
+    # ---- 系数：远场 LSQ + A.18 的换算 ----
+    def _solve_coefficients(self):
+        N = len(self.beams)
+        L = np.array([b.L for b in self.beams])
+        dirs = np.array([b.dir for b in self.beams])
+        # 测试格点：与格点同一套六边形排布，但角距减半（原文允许的"减小 Δθ"）
+        test_z = self.gfd.hex_directions(self.theta_cover, self.dtheta / 2.0)
+        S = self.gfd.rotate_to_axis(test_z, self.ax)
+        A = self._basis_ang(np.clip(S @ dirs.T, -1.0, 1.0))          # (M,N)
+        theta_t = np.arccos(np.clip(S @ self.ax, -1.0, 1.0))
+        y = np.asarray(self.feed.far_field_amplitude(theta_t), dtype=float)
+        A_unit, y_unit = A.copy(), y.copy()
+        if self.reg > 0:                    # 轻微 Tikhonov（远场版原文没要求，留着防病态）
+            sc = np.linalg.norm(A) / np.sqrt(max(A.size, 1))
+            A = np.vstack([A, np.sqrt(self.reg) * sc * np.eye(N)])
+            y = np.concatenate([y, np.zeros(N)])
+        sol, *_ = np.linalg.lstsq(A, y, rcond=None)
+        self.sol = sol
+        self.sing_vals = (np.linalg.svd(A_unit, compute_uv=False)
+                          if self.want_sing_vals else None)
+        # 远区系数 A_n -> 反射点处入射场幅度 H0_n（A.18 的 (★)）
+        h0 = sol * np.exp(-1j * self.k * L) / (L + 1j * self.b)
+        for b, c in zip(self.beams, h0):
+            b.coef = complex(c)
+            b.beam.H0 = c * b.beam.xi_dir.astype(complex)
+        self.residual = float(np.linalg.norm(A_unit @ sol - y_unit)
+                              / max(np.linalg.norm(y_unit), 1e-30))
+
+
+# --------------------------------------------------------------------------- #
 # 远场合成
 # --------------------------------------------------------------------------- #
 def directions(theta_deg, phi_deg):
@@ -353,9 +527,48 @@ def directions(theta_deg, phi_deg):
                      np.cos(th)], axis=-1)
 
 
+def _go_fast(expansion, k=None):
+    """取得（并缓存）该展开的纯 GO 精简求值器 —— 见 gb_go_edge.GoReflectionFast"""
+    import gb_go_edge as _ge
+    obj = getattr(expansion, "_go_fast", None)
+    if obj is None or (k is not None and obj.k != float(k)):
+        obj = _ge.GoReflectionFast(expansion, k=k)
+        expansion._go_fast = obj
+    return obj
+
+
+def _goedge_fast(expansion, k=None):
+    """取得（并缓存）goedge 的扁平化加速版 —— 见 gb_go_edge.GoEdgeFast (REPORT A.32)"""
+    import gb_go_edge as _ge
+    obj = getattr(expansion, "_goedge_fast", None)
+    if obj is None or (k is not None and obj.k != float(k)):
+        obj = _ge.GoEdgeFast(expansion, k=k,
+                             crescent=bool(getattr(expansion, "goedge_crescent", True)))
+        expansion._goedge_fast = obj
+    return obj
+
+
+def _literal_fast(expansion, k=None):
+    """取得（并缓存）literal 的扁平化加速版 —— 见 gb_literal_fast.LiteralFast (REPORT A.38)
+
+    与逐束 `ChouPathakSingle.Ps` 数值等价（实测相对差 8e-16），但整份展开一次算完。
+    只支持生产默认那条纯闭式路径（edge_q="frozen"、无月牙、quartic_pure）。
+    """
+    import gb_literal_fast as _lf
+    obj = getattr(expansion, "_literal_fast", None)
+    if obj is None or (k is not None and obj.k != float(k)):
+        obj = _lf.LiteralFast(expansion, k=k)
+        expansion._literal_fast = obj
+    return obj
+
+
 def gbma_far_field(expansion, S, origin=None, stable=True, per_beam=False, k=None,
-                   form=None):
+                   form=None, phi1se_mode="newton"):
     """合成远场 Ω(S) = Σ_n Rot·P̄^s_n(Rot^T S)·exp(+jk S·(O_n-O_0))
+
+    phi1se_mode: 边缘点 φ₁ₛ 的解法, 透传给 ChouPathakSingle.Ps
+        'newton'(默认) / 'cubic' / 'cubic_pure' / 'quartic_pure' / 'closed'
+        见 REPORT A.21。
 
     返回 (Omega (M,3), info dict)
     """
@@ -367,7 +580,24 @@ def gbma_far_field(expansion, S, origin=None, stable=True, per_beam=False, k=Non
         k = expansion.beams[0].solver.k
     if form is None:
         form = "stable" if stable else "literal"
-    _KEY = {"stable": "Ps_stable", "literal": "Ps", "auto": "Ps_auto"}
+    # ---- go2 / goedge2 / literal2: 扁平化的精简快速通道（整份展开一次算完）----
+    if form in ("go2", "goedge2", "literal2"):
+        t0 = time.perf_counter()
+        if form == "go2":
+            Of = _go_fast(expansion, k).far_field(S, origin)
+        elif form == "goedge2":
+            Of = _goedge_fast(expansion, k).far_field(S, origin)
+        else:
+            Of = _literal_fast(expansion, k).far_field(S, origin)
+        info = {"n_beams": len(expansion.beams), "n_clip": 0, "n_transition": 0,
+                "form": _FORM_NAME[form], "form_key": form,
+                "phi1se_mode": phi1se_mode, "t_sweep": time.perf_counter() - t0}
+        if per_beam:
+            raise ValueError(f"form={form!r} 的精简通道不支持 per_beam")
+        return Of * _IMPEDANCE_SCALE, info
+    _KEY = {"stable": "Ps_stable", "literal": "Ps", "auto": "Ps_auto",
+            "crescent": "Ps_crescent", "analytic": "Ps_analytic",
+            "goedge": "Ps_analytic", "go": "Pr", "go2": "Pr", "goedge2": "Ps_analytic"}
     if form not in _KEY:
         raise ValueError(f"form 只能是 {list(_KEY)}, 收到 {form!r}")
     out = np.zeros((nS, 3), dtype=complex)
@@ -377,7 +607,24 @@ def gbma_far_field(expansion, S, origin=None, stable=True, per_beam=False, k=Non
     for j, b in enumerate(expansion.beams):
         Rl = np.stack([b.lm.xhat, b.lm.yhat, b.lm.zhat])       # 行 = 局部基
         Sl = S @ Rl.T                                          # 全局 -> 局部 分量
-        d = b.solver.Ps(Sl)
+        if form == "analytic":
+            d = b.analytic.Ps(Sl)                     # 纯解析路径 (无复根求解)
+        elif form == "goedge":
+            d = b.goedge.Ps(Sl)                       # GO 反射 + PO 边缘衍射
+        elif form == "go2":
+            # 单形式快速通道: 只算 GO 反射本体, 不碰边缘项
+            term = (b.goedge.Pr_only(Sl) @ Rl) * np.exp(
+                1j * k * (S @ (b.O - origin)))[:, None]
+            out += term
+            continue
+        elif form == "go":
+            # 单形式快速通道: 只算 P_r, 不碰 (B7)/端点项
+            term = (b.solver.Pr_only(Sl) @ Rl) * np.exp(
+                1j * k * (S @ (b.O - origin)))[:, None]
+            out += term
+            continue
+        else:
+            d = b.solver.Ps(Sl, phi1se_mode=phi1se_mode)
         P_local = np.asarray(d[_KEY[form]])
         P_glob = P_local @ Rl                                  # 局部 -> 全局
         piston = np.exp(1j * k * (S @ (b.O - origin)))
@@ -389,12 +636,149 @@ def gbma_far_field(expansion, S, origin=None, stable=True, per_beam=False, k=Non
             contrib[:, j] = np.sum(np.abs(term) ** 2, axis=-1)
     _NAME = {"stable": "stable: Pr*[1+erf(Sa)]/2",
              "literal": "literal: T*Pr+Pd",
-             "auto": "auto: |Sa|>1.5 用字面式, <0.7 用稳定式(平滑过渡)"}
+             "auto": "auto: |Sa|>1.5 用字面式, <0.7 用稳定式(平滑过渡)",
+             "crescent": "crescent(嫁接式, 仅对照): Pr*([1+erf(Sa)]/2 - S_ratio)",
+             "analytic": "analytic(纯解析, 无复根): P_r*([1+erf(√c_eff d_r - jk b_eff/2√c_eff)]/2 - S_ratio) [A.27]",
+             "goedge": "goedge(GO 反射+PO 边缘): F0·解析远场·([1+erf(Z)]/2 - S_ratio) [A.28]",
+             "go": "go(只反射, 无边缘): P_r —— 论文 L750-753 的'边缘不存在时的反射场'",
+             "go2": "go2(只反射, 无边缘): goedge 的 GO 反射本体 = F0·解析远场（Rieckmann 的几何波）"}
     info = {"n_beams": len(expansion.beams), "n_clip": n_clip, "n_transition": n_tr,
-            "form": _NAME[form], "form_key": form}
+            "form": _NAME[form], "form_key": form, "phi1se_mode": phi1se_mode}
     if per_beam:
         info["per_beam"] = contrib
     return out * _IMPEDANCE_SCALE, info
+
+
+# 各 form 对应的数据键（供多次/多形式合成共用）
+_FORM_KEY = {"stable": "Ps_stable", "literal": "Ps", "auto": "Ps_auto",
+             "crescent": "Ps_crescent", "go": "Pr", "go2": "Pr"}
+_FORM_NAME = {"stable": "stable: Pr*[1+erf(Sa)]/2",
+              "literal": "literal: T*Pr+Pd",
+              "auto": "auto: |Sa|>1.5 用字面式, <0.7 用稳定式(平滑过渡)",
+              "crescent": "crescent(嫁接式, 仅对照): Pr*([1+erf(Sa)]/2 - S_ratio)",
+              "analytic": "analytic(纯解析, 无复根): P_r*([1+erf(√c_eff d_r - jk b_eff/2√c_eff)]/2 - S_ratio) [A.27]",
+              "goedge": "goedge(GO 反射+PO 边缘): F0·解析远场·([1+erf(Z)]/2 - S_ratio) [A.28]",
+              "go": "go(只反射, 无边缘): P_r —— 论文 L750-753 的'边缘不存在时的反射场'",
+              "go2": "go2(只反射, 无边缘): goedge 的 GO 反射本体 = F0·解析远场（Rieckmann 的几何波）",
+              "goedge2": "goedge2(扁平化 goedge): F0·解析远场·[E(Z)−(sgn/2)erfc(sgnZ) − S_ratio] [A.32]",
+              "literal2": "literal2(扁平化 literal): 与 literal 逐元素同一算式, 整份展开一次算完 [A.38]"}
+
+
+def gbma_far_field_multi(expansion, S, forms, origin=None, k=None,
+                         phi1se_mode="newton", per_beam=False):
+    """**一次遍历同时累积多个合成式**的远场 —— REPORT A.30
+
+    动机：`ChouPathakSingle.Ps` 一次就返回 Ps / Ps_stable / Ps_auto / Pr / Pd，
+    所以同一份展开下多要几种曲线，本来只是"多读几个键 + 多累加一次"。
+    原先 c.py 对每个额外 form 重新扫一遍 91 束（重算 Ps），白花 2~3 倍时间。
+
+    按**解器**分组，每束每组只调用一次：
+      solver  : 'stable' / 'literal' / 'auto' / 'crescent' / 'go'
+                （若只请求 'go'，走 `Pr_only` 快速通道，不算 (B7)/端点项）
+      goedge  : 'goedge' / 'go2'
+                （若只请求 'go2'，走 `Pr_only`，不算边缘项）
+      analytic: 'analytic'
+
+    返回 (dict{form: Omega (M,3)}, info)
+    """
+    forms = [str(f).lower() for f in forms]
+    _allowed = list(_FORM_KEY) + ["analytic", "goedge", "goedge2", "literal2"]
+    for f in forms:
+        if f not in _FORM_KEY and f not in ("analytic", "goedge", "goedge2", "literal2"):
+            raise ValueError(f"form 只能是 {_allowed}，收到 {f!r}")
+    S = np.atleast_2d(np.asarray(S, dtype=float))
+    nS = len(S)
+    if origin is None:
+        origin = np.zeros(3)
+    if k is None:
+        k = expansion.beams[0].solver.k
+    out = {f: np.zeros((nS, 3), dtype=complex) for f in set(forms)}
+    contrib = ({f: np.zeros((nS, len(expansion.beams)), dtype=complex)
+                for f in set(forms)} if per_beam else None)
+    n_clip = 0
+    n_tr = 0
+    solver_forms = [f for f in forms if f in _FORM_KEY and f not in ("go2", "goedge2", "literal2")]
+    goedge_forms = [f for f in forms if f == "goedge"]
+    need_go2 = "go2" in forms
+    need_goedge2 = "goedge2" in forms
+    need_literal2 = "literal2" in forms
+    need_analytic = "analytic" in forms
+    t_loop0 = time.perf_counter()
+    t_ps = 0.0
+    t_solve_by = {}                 # 独立解器(goedge/analytic)的累计求解时间
+    t_acc = {}
+    if need_go2:
+        _t = time.perf_counter()
+        out["go2"] = _go_fast(expansion, k).far_field(S, origin)
+        t_acc["go2"] = time.perf_counter() - _t              # 独立批量调用, 整段都算它
+        t_ps += 0.0
+    if need_goedge2:
+        _t = time.perf_counter()
+        out["goedge2"] = _goedge_fast(expansion, k).far_field(S, origin)
+        t_acc["goedge2"] = time.perf_counter() - _t
+    if need_literal2:
+        _t = time.perf_counter()
+        out["literal2"] = _literal_fast(expansion, k).far_field(S, origin)
+        t_acc["literal2"] = time.perf_counter() - _t
+    if (need_go2 or need_goedge2 or need_literal2) and per_beam:
+        raise ValueError("forms 含 'go2'/'goedge2'/'literal2' 时不支持 per_beam")
+
+    def _acc(f, P_local, Rl, piston, j):
+        _t = time.perf_counter()
+        term = (np.asarray(P_local) @ Rl) * piston[:, None]
+        out[f] += term
+        if per_beam:
+            contrib[f][:, j] = np.sum(np.abs(term) ** 2, axis=-1)
+        t_acc[f] = t_acc.get(f, 0.0) + (time.perf_counter() - _t)
+
+    for j, b in enumerate(expansion.beams):
+        Rl = np.stack([b.lm.xhat, b.lm.yhat, b.lm.zhat])
+        Sl = S @ Rl.T
+        piston = np.exp(1j * k * (S @ (b.O - origin)))
+        # ---- solver 组 ----
+        if solver_forms:
+            _t = time.perf_counter()
+            if solver_forms == ["go"]:
+                P = b.solver.Pr_only(Sl)                    # 快速通道: 只算 P_r
+                d = None
+            else:
+                d = b.solver.Ps(Sl, phi1se_mode=phi1se_mode)
+            t_ps += time.perf_counter() - _t
+            if d is not None:
+                n_clip += int(np.asarray(d.get("n_clip", 0)))
+                n_tr += int(np.sum(np.abs(np.asarray(d["Sa"])) < 1.0))
+                for f in solver_forms:
+                    _acc(f, d[_FORM_KEY[f]], Rl, piston, j)
+            else:
+                _acc("go", P, Rl, piston, j)
+        # ---- goedge 组（独立解器：其求解时间要归到 goedge 这条曲线头上）----
+        if goedge_forms:
+            _t = time.perf_counter()
+            dg = b.goedge.Ps(Sl)
+            t_solve_by["goedge"] = t_solve_by.get("goedge", 0.0) + (time.perf_counter() - _t)
+            t_ps += time.perf_counter() - _t
+            for f in goedge_forms:
+                _acc(f, dg["Ps_analytic"], Rl, piston, j)
+        # ---- analytic（同理）----
+        if need_analytic:
+            _t = time.perf_counter()
+            P = b.analytic.Ps(Sl)["Ps_analytic"]
+            t_solve_by["analytic"] = t_solve_by.get("analytic", 0.0) + (time.perf_counter() - _t)
+            _acc("analytic", P, Rl, piston, j)
+    t_loop = time.perf_counter() - t_loop0
+    for f, v in t_solve_by.items():           # 独立解器的曲线, 求解时间并入其边际成本
+        t_acc[f] = t_acc.get(f, 0.0) + v
+    out = {f: v * _IMPEDANCE_SCALE for f, v in out.items()}
+    info = {"n_beams": len(expansion.beams), "n_clip": n_clip, "n_transition": n_tr,
+            "forms": forms, "phi1se_mode": phi1se_mode,
+            "form": _FORM_NAME.get(forms[0], forms[0]), "form_key": forms[0],
+            # 实测：整次 sweep 里"逐束求解"占多少，剩下的是多形式累加/旋转的边际成本
+            "t_sweep": t_loop, "t_per_beam_solve": t_ps,
+            "t_acc_by_form": dict(t_acc),
+            "t_accum_all": max(t_loop - t_ps, 0.0)}
+    if per_beam:
+        info["per_beam"] = contrib
+    return out, info
 
 
 def po_reference(expansion, S, n_rr=220, n_ph=768, k=None):
@@ -449,7 +833,11 @@ def compute_feed_total_power(feed):
 
 def compute_far_field_gbma(feed, cfg, theta_scan_deg, n_beams=None, overlap=None,
                            theta_fill=None, reg=None, verbose=True,
-                           phi_deg=0.0, return_expansion=False, form="auto"):
+                           phi_deg=0.0, return_expansion=False, form=None,
+                           phi1se_mode=None, decomp=None, w_rel=None, cone_margin=None,
+                           ff_basis=None, edge_crescent=None, crescent_order=None,
+                           goedge_takenaka=None, goedge_crescent=None,
+                           extra_forms=None):
     """馈源分解 → 逐束反射 → 合成的总入口。
 
     参数
@@ -457,10 +845,16 @@ def compute_far_field_gbma(feed, cfg, theta_scan_deg, n_beams=None, overlap=None
     feed   : feed_antenna.FeedAntenna
     cfg    : c.py 的 AntennaConfig (用到 freq/F/D/offset_x/offset_y)
     theta_scan_deg : 观察角数组(度), 从反射面 +z 轴起算
-    n_beams        : 束数(吸附到最近六边形格点数), None -> cfg.gbma_n_beams
-    overlap        : 格点角距 / GB 角半径, None -> cfg.gbma_overlap
-    theta_fill     : 覆盖角 / 口径张角, None -> cfg.gbma_theta_fill
+    n_beams        : 束数（近场版=吸附到最近六边形格点数；远场版=最小束数）, None -> cfg
+    overlap        : 格点角距 / GB 角半径, None -> cfg.gbma_overlap   （仅近场版）
+    theta_fill     : 覆盖角 / 口径张角, None -> cfg.gbma_theta_fill  （仅近场版）
     reg            : 点匹配正则, None -> cfg.gbma_reg
+    phi1se_mode    : 边缘点 phi1se 解法, None -> cfg.gbma_phi1se_mode
+                     ('newton'/'cubic'/'cubic_pure'/'quartic_pure'/'closed', 见 REPORT A.21)
+    decomp         : 'near'（默认, 反射面上点匹配）/ 'farfield'（馈源远场点匹配, chou2001 §II）
+    w_rel          : 远场版在 (19) 窗口内选 w 的位置 [0,1], None -> cfg.gbma_w_rel
+    cone_margin    : 远场版覆盖锥相对边缘角的余量, None -> cfg.gbma_cone_margin
+    ff_basis       : 远场版基函数 'paper'/'beam', None -> cfg.gbma_ff_basis
 
     返回 (E (N,3) 复数, dBi (N,), info dict)
     """
@@ -468,10 +862,45 @@ def compute_far_field_gbma(feed, cfg, theta_scan_deg, n_beams=None, overlap=None
     overlap = getattr(cfg, "gbma_overlap", 1.2) if overlap is None else overlap
     theta_fill = getattr(cfg, "gbma_theta_fill", 1.02) if theta_fill is None else theta_fill
     reg = getattr(cfg, "gbma_reg", 1e-8) if reg is None else reg
+    if form is None:
+        form = getattr(cfg, "gbma_form", "auto")
+    if phi1se_mode is None:
+        phi1se_mode = getattr(cfg, "gbma_phi1se_mode", "newton")
+    if decomp is None:
+        decomp = getattr(cfg, "gbma_decomp", "near")
+    if w_rel is None:
+        w_rel = getattr(cfg, "gbma_w_rel", 0.40)
+    if cone_margin is None:
+        cone_margin = getattr(cfg, "gbma_cone_margin", 1.10)
+    if ff_basis is None:
+        ff_basis = getattr(cfg, "gbma_ff_basis", "paper")
+    if edge_crescent is None:
+        edge_crescent = getattr(cfg, "gbma_edge_crescent", False)
+    if crescent_order is None:
+        crescent_order = getattr(cfg, "gbma_crescent_order", 1)
+    if goedge_takenaka is None:
+        goedge_takenaka = getattr(cfg, "gbma_goedge_takenaka", True)
+    if goedge_crescent is None:
+        goedge_crescent = getattr(cfg, "gbma_goedge_crescent", True)
+    if extra_forms is None:
+        extra_forms = getattr(cfg, "gbma_extra_forms", ())
 
     refl = ParabolicReflector(cfg.F, cfg.D, cfg.offset_x, cfg.offset_y)
-    exp = FeedGBExpansion(feed, refl, n_beams=n_beams, overlap=overlap,
-                          theta_fill=theta_fill, reg=reg, verbose=verbose).build()
+    if str(decomp).lower() in ("farfield", "far", "ff"):
+        exp = FarFieldFeedGBExpansion(feed, refl, n_beams=n_beams, w_rel=w_rel,
+                                      cone_margin=cone_margin, reg=reg,
+                                      verbose=verbose, basis=ff_basis,
+                                      edge_crescent=edge_crescent,
+                                      crescent_order=crescent_order,
+                                      goedge_takenaka=goedge_takenaka,
+                                      goedge_crescent=goedge_crescent).build()
+    else:
+        exp = FeedGBExpansion(feed, refl, n_beams=n_beams, overlap=overlap,
+                              theta_fill=theta_fill, reg=reg, verbose=verbose,
+                              edge_crescent=edge_crescent,
+                              crescent_order=crescent_order,
+                              goedge_takenaka=goedge_takenaka,
+                              goedge_crescent=goedge_crescent).build()
 
     S = directions(theta_scan_deg, phi_deg)
     if form == "literal":
@@ -479,10 +908,34 @@ def compute_far_field_gbma(feed, cfg, theta_scan_deg, n_beams=None, overlap=None
               "各自发散且数值上不能完全相消, 会给出 1e2 以上的假电平(仅供对照)")
     if form == "auto":
         print("  合成式: auto(远离阴影边界用字面式, |S_a|<0.7 切到稳定式)")
-    E, info = gbma_far_field(exp, S, form=form)
+    if form == "crescent":
+        print("  合成式: crescent(嫁接式, 仅对照): 在现有 fall 上减 S_ratio, 需加窗+上限")
+    if form == "analytic":
+        print("  合成式: analytic(纯解析): P_r*([1+erf(√c_eff·d_r)]/2 - S_ratio), "
+              "无复根求解/无窗 (REPORT A.27)")
+    if form == "goedge":
+        print(f"  合成式: goedge(GO 反射 + PO 边缘): {'Takenaka erfc 分支式' if goedge_takenaka else '紧致 erf 式'}"
+              f"{' + 月牙' if goedge_crescent else ''} (REPORT A.28)")
+    if phi1se_mode != "newton":
+        print(f"  边缘点 phi1se 解法: {phi1se_mode}"
+              f"({'四次闭式, 无 (B13) 近似' if phi1se_mode in ('quartic_pure', 'closed') else phi1se_mode})")
+    # ---- 合成：主曲线 + 可选的额外曲线，**一次遍历**同时累积（REPORT A.30）----
+    extra_forms = tuple(str(f).lower() for f in (extra_forms or ()))
+    extra_forms = tuple(f for f in extra_forms if f != str(form).lower())
+    if extra_forms:
+        outs, info = gbma_far_field_multi(exp, S, [form] + list(extra_forms),
+                                          phi1se_mode=phi1se_mode)
+        E = outs[form]
+    else:
+        outs = {}
+        E, info = gbma_far_field(exp, S, form=form, phi1se_mode=phi1se_mode)
     P_total = compute_feed_total_power(feed)
     U = np.sum(np.abs(E) ** 2, axis=-1)
     dBi = 10.0 * np.log10(4.0 * np.pi * U / P_total + 1e-30)
+    extra_dBi = {}
+    for _f in extra_forms:
+        _U = np.sum(np.abs(outs[_f]) ** 2, axis=-1)
+        extra_dBi[_f] = 10.0 * np.log10(4.0 * np.pi * _U / P_total + 1e-30)
     if verbose and info.get("n_transition", 0) > 0:
         print(f"  提示: 有 {info['n_transition']} 个 (束,方向) 落在 |S_a|<1 的过渡区"
               f"(阴影边界); 这些点必须用稳定式, 字面式在此发散")
@@ -494,6 +947,11 @@ def compute_far_field_gbma(feed, cfg, theta_scan_deg, n_beams=None, overlap=None
                      theta_cover=np.degrees(exp.theta_cover),
                      dtheta=np.degrees(exp.dtheta), w0=exp.w0, b=exp.b,
                      overlap=overlap, theta_fill=theta_fill,
+                     decomp=decomp, w_rel=w_rel,
+                     edge_crescent=edge_crescent, crescent_order=crescent_order,
+                     goedge_takenaka=goedge_takenaka,
+                     goedge_crescent=goedge_crescent,
+                     extra_dBi=extra_dBi,
                      n_inside=sum(1 for b in exp.beams if b.inside)))
     if return_expansion:
         return E, dBi, info

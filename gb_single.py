@@ -79,6 +79,53 @@ def cbrt(z):
     return np.power(np.asarray(z, dtype=complex), 1.0 / 3.0)
 
 
+def _cubic_one_root(a2, a1, a0):
+    """x^3 + a2 x^2 + a1 x + a0 = 0 的**一个**根（Cardano, 向量化, 复数）
+
+    与 `phi1se_cubic` 里的 (B16)-(B23) 同一套公式; 单独抽出来供四次方程的
+    Ferrari 分解式调用（那里需要解预解三次 z^3 + p z^2 + q z + r = 0）。
+    """
+    a2 = np.asarray(a2, dtype=complex)
+    a1 = np.asarray(a1, dtype=complex)
+    a0 = np.asarray(a0, dtype=complex)
+    Q = (3.0 * a1 - a2 ** 2) / 9.0
+    R = (9.0 * a2 * a1 - 27.0 * a0 - 2.0 * a2 ** 3) / 54.0
+    disc = Q ** 3 + R ** 2
+    Sst = cbrt(R + np.sqrt(np.asarray(disc, dtype=complex)))
+    ok = np.abs(Sst) > 1e-300
+    Tst = np.where(ok, -Q / np.where(ok, Sst, 1.0), 0.0)
+    return Sst + Tst - a2 / 3.0
+
+
+def _quartic_all_roots(qa, qb, qc, qd, qe):
+    """qa s^4 + qb s^3 + qc s^2 + qd s + qe = 0 的 4 个根（Ferrari, 向量化, 复数）
+
+    返回 shape = (4,) + broadcast(输入) 的数组; 系数 qa≈0 时按最低次处理不做,
+    这类点由调用方的有效性判据筛掉。
+    """
+    qa = np.asarray(qa, dtype=complex)
+    safe = np.where(np.abs(qa) > 1e-300, qa, 1.0)
+    b = np.asarray(qb, dtype=complex) / safe
+    c = np.asarray(qc, dtype=complex) / safe
+    d = np.asarray(qd, dtype=complex) / safe
+    e = np.asarray(qe, dtype=complex) / safe
+    # 消去三次项: s = y - b/4  =>  y^4 + p y^2 + q y + r = 0
+    p = c - 3.0 * b ** 2 / 8.0
+    q = d - b * c / 2.0 + b ** 3 / 8.0
+    r = e - b * d / 4.0 + b ** 2 * c / 16.0 - 3.0 * b ** 4 / 256.0
+    # 分解 (y^2+A)^2 - (B y + C)^2, A 满足 A^3 - (p/2)A^2 - rA + (rp/2 - q^2/8) = 0
+    A = _cubic_one_root(-p / 2.0, -r, r * p / 2.0 - q ** 2 / 8.0)
+    B = np.sqrt(2.0 * A - p)
+    okB = np.abs(B) > 1e-12
+    C = np.where(okB, -q / (2.0 * np.where(okB, B, 1.0)), 0.0)
+    out = []
+    for bb, cst in ((B, A + C), (-B, A - C)):
+        sq = np.sqrt(bb ** 2 - 4.0 * cst)
+        out.append((-bb + sq) / 2.0 - b / 4.0)
+        out.append((-bb - sq) / 2.0 - b / 4.0)
+    return np.stack(out, axis=0)
+
+
 # --------------------------------------------------------------------------- #
 # 反射面
 # --------------------------------------------------------------------------- #
@@ -456,7 +503,7 @@ class ChouPathakSingle:
     """单束 GB 的 P^s 闭式解. S 为观察方向 (局部系单位矢)."""
 
     def __init__(self, lm, beam, k=None, form_lo=0.7, form_hi=1.5, form_eps=1e-3,
-                 edge_q="frozen"):
+                 edge_q="frozen", edge_crescent=False, crescent_order=1):
         self.lm = lm
         self.beam = beam
         self.k = beam.k if k is None else float(k)
@@ -476,6 +523,14 @@ class ChouPathakSingle:
         #   真正的宽角误差在端点项自身的领先阶求值(prefactor/g'_rho/g''_phi/单端点),
         #   要改需要重做端点积分, 不是两行补丁。
         self.edge_q = str(edge_q)
+        # edge_crescent: 给直边截断因子 T 加**边缘曲率（月牙）修正**（REPORT A.24/A.25）
+        #   来源: 用户提供的 slit_series.py（另一实现的 gbma_edge.slit_correction）。
+        #   原理: 我们 (62) 的 T=½[1+erf(S_a)] 是"局部直边"结果; 真实曲边比直边
+        #   少积一块月牙区 {d_r-κη²/2 <= ξ <= d_r}, 用 erf 的 Taylor 级数 + 复高斯矩
+        #   闭式求和, 不做任何复根求解。默认**关**, 打开后 Ps 多返回 Ps_crescent。
+        #   实测(A.25): 边界束 |T| 0.5000 → 0.4767, PO 反推 0.4547~0.4679。
+        self.edge_crescent = bool(edge_crescent)
+        self.crescent_order = int(crescent_order)
         self.Q0 = beam.Q(0.0)
         self.c = beam.C
 
@@ -503,8 +558,8 @@ class ChouPathakSingle:
         return a0, a1, b0, b1, cc
 
     # ---------- (33)-(36) 驻定相位点 ----------
-    def stationary(self, S):
-        a0, a1, b0, b1, cc = self.coeffs(S)
+    def stationary(self, S, c5=None):
+        a0, a1, b0, b1, cc = self.coeffs(S) if c5 is None else c5
         den = a0 * a1 - cc ** 2
         xs = (a1 * b0 - b1 * cc) / (2.0 * den)                 # (34)
         ys = (a0 * b1 - b0 * cc) / (2.0 * den)                 # (35)
@@ -512,6 +567,18 @@ class ChouPathakSingle:
         # 若误写成负号, Im(f_s) 会反号, e^{jk f_s} 随角度指数发散(实测 +300 dB).
         fs = (a1 * b0 ** 2 + a0 * b1 ** 2 - 2.0 * b1 * b0 * cc) / (4.0 * den)
         return xs, ys, fs, den
+
+    def _cache(self, S):
+        """把**与 φ 无关**的量算一次: (a0,a1,b0,b1,cc, xs,ys,fs,den)
+
+        Ps 内部有 phi1se 求解(含多次迭代/线搜索)、_edge_terms、gpp_rho 等多个子步骤都要
+        用到这 9 个数；过去每处都重算一遍(实测每束 8 次 coeffs、4 次 stationary,
+        占 Ps 的 24%)。现在统一算一次、按参数传下去。
+        """
+        c5 = self.coeffs(S)
+        xs, ys, fs, den = self.stationary(S, c5)
+        return c5 + (xs, ys, fs, den)
+
 
     # ---------- (25) F(x',y'), 电场版 ----------
     def fbar(self, x, y, S):
@@ -535,11 +602,145 @@ class ChouPathakSingle:
         J = np.cross(nvl, Hm)                                   # (17) 的 J_eq dS'
         return (1j * self.k * Z0 / (2.0 * np.pi)) * np.cross(S, np.cross(S, J))   # (25), 1/R -> 1
 
-    # ---------- 附录 B: rho1=d 处的 phi1se ----------
-    def _edge_terms(self, S, phi):
+    # ---------- 边缘曲率(月牙)修正: 几何 + 级数 (REPORT A.24/A.25) ----------
+    def rim_nearest(self, xs, ys, iters=2):
+        """(x_s,y_s) 到投影边缘椭圆 (rho1 = d) 的最近点 (实轴, 非复解)
+
+        边缘是 (x,y) = (x_o,y_o) + d*[A1 cos φ + A2 sin φ, B1 cos φ + B2 sin φ]。
+        最近点满足 h(φ) = (p - r)·r' = 0, 用牛顿解（初值取归一化径向方向）。
+        实测：仅在径向初值上做 1 步牛顿，d_r 相对差 7e-5、kappa 5e-3，
+        **S_ratio 与 8 步逐位相同** ⟹ 默认 2 步（96 ms → 见 _verify_crescent.py）。
+
+        返回 dict: phi, d_r(口径内为正), er(朝外的单位矢), ep(切向), kappa(该点曲率)
+        """
         lm = self.lm
-        a0, a1, b0, b1, cc = self.coeffs(S)
-        xs, ys, fs, den = self.stationary(S)
+        xs = np.real(np.asarray(xs, dtype=complex))
+        ys = np.real(np.asarray(ys, dtype=complex))
+        d = float(lm.d)
+        dx, dy = xs - lm.xo, ys - lm.yo
+        u = lm.Minv[0, 0] * dx + lm.Minv[0, 1] * dy
+        v = lm.Minv[1, 0] * dx + lm.Minv[1, 1] * dy
+        rho_n = np.hypot(u, v)                       # 归一化径向坐标, 边缘在 rho=d
+        phi0 = np.arctan2(v, u) - lm.phi0            # 初值: 径向方向
+        phi = phi0.copy()
+        for _ in range(iters):
+            c, s = np.cos(phi), np.sin(phi)
+            Xr = lm.A1 * c + lm.A2c * s
+            Yr = lm.B1 * c + lm.B2c * s
+            Xrp = -lm.A1 * s + lm.A2c * c
+            Yrp = -lm.B1 * s + lm.B2c * c
+            px = xs - (lm.xo + d * Xr)
+            py = ys - (lm.yo + d * Yr)
+            tx, ty = d * Xrp, d * Yrp
+            h = px * tx + py * ty
+            hp = -(tx * tx + ty * ty) - d * (px * Xr + py * Yr)
+            phi = phi - h / np.where(np.abs(hp) < 1e-300, 1e-300, hp)
+        c, s = np.cos(phi), np.sin(phi)
+        Xr = lm.A1 * c + lm.A2c * s
+        Yr = lm.B1 * c + lm.B2c * s
+        Xrp = -lm.A1 * s + lm.A2c * c
+        Yrp = -lm.B1 * s + lm.B2c * c
+        rx, ry = lm.xo + d * Xr, lm.yo + d * Yr
+        # 法向: 与 (r - 椭圆中心) 同向者为"朝外"
+        tx, ty = d * Xrp, d * Yrp
+        tn = np.hypot(tx, ty)
+        nx, ny = ty / tn, -tx / tn
+        flip = (nx * (rx - lm.xo) + ny * (ry - lm.yo)) < 0.0
+        nx = np.where(flip, -nx, nx)
+        ny = np.where(flip, -ny, ny)
+        dist = np.hypot(rx - xs, ry - ys)
+        # 曲率: κ = |det M| / (d |r'|^3)  (见 REPORT A.25.1)
+        kappa = lm.jac / (d * tn ** 3)
+        return {"phi": phi, "d_r": np.where(rho_n <= d, dist, -dist),
+                "er": np.stack([nx, ny], axis=-1),
+                "ep": np.stack([-ny, nx], axis=-1),
+                "kappa": kappa, "dist": dist}
+
+    # ---------- 只算反射本体（论文 L750-753 的"边缘不存在时的反射场"）----------
+    def Pr_only(self, S, cache=None):
+        """只返回 P_r，**不碰** (B7)/端点项/过渡函数 —— 供 form="go" 的快速通道
+
+        P_r 只依赖 (a0,a1,cc,xs,ys,fs,den) 与鞍点处的矢量幅度，因此省掉
+        phi1se 复根求解、_edge_terms、gpp、erf 等全部边缘机件（实测快 3~4×）。
+        """
+        S = np.atleast_2d(np.asarray(S, dtype=float))
+        c5 = self._cache(S) if cache is None else cache
+        a0, a1, b0, b1, cc, xs, ys, fs, den = c5
+        with np.errstate(all="ignore"):
+            Fs = self.fbar(xs, ys, S)
+            w1 = spim(-1j * self.k * a1)
+            w2 = spim(-1j * self.k * (den / a1))
+            Pr = (-np.pi / (w1 * w2))[..., None] * Fs * np.exp(1j * self.k * fs)[..., None]
+        bad = ~np.isfinite(Pr).all(axis=-1)
+        if np.any(bad):
+            Pr = np.where(bad[..., None], 0.0, Pr)
+        return Pr
+
+    def crescent_ratio(self, S, cache=None, order=None):
+        """月牙(曲边)修正 S_ratio: 真实曲边比"切线直边"少积的那块
+
+        在**鞍点处**展开 f, 一次项恒为 0 ⟹ u_r = u_phi = 0 ⟹ Z = sqrt(c_r)·d_r。
+        符号约定: c = +jk*a（`coeffs()` 的 a 与物理二次相位反号, 由 Re c > 0
+        = 高斯衰减唯一确定; 校验: 1/sqrt(Re c_phi) 必须等于束斑半径 w）。
+        交叉项用 Schur 补吸收: a_eff = a_ξξ - a_ξη²/a_ηη。
+
+        返回 dict: S_ratio, Z, T_straight(=½[1+erf Z]), d_r, kappa, ok
+        """
+        lm, k = self.lm, self.k
+        if cache is None:
+            cache = self._cache(S)
+        a0, a1, b0, b1, cc, xs, ys = (cache[0], cache[1], cache[2], cache[3],
+                                      cache[4], cache[5], cache[6])
+        order = self.crescent_order if order is None else int(order)
+        _shp = np.shape(np.real(np.asarray(xs)))
+        zero = np.zeros(np.broadcast_shapes(_shp, np.shape(np.real(np.asarray(ys)))),
+                        dtype=float)
+        out0 = {"S_ratio": zero.astype(complex), "Z": zero.astype(complex),
+                "T_straight": np.full_like(zero, 0.5), "d_r": zero,
+                "kappa": zero, "ok": np.zeros(np.shape(zero), dtype=bool)}
+        if (not np.isfinite(lm.d)) or lm.d <= 0.0 or bool(getattr(lm, "d_imag", False)):
+            return out0
+
+        gm = self.rim_nearest(xs, ys)
+        er, ep = gm["er"], gm["ep"]
+        a0 = np.asarray(a0, dtype=complex) + 0.0 * er[..., 0]
+        a1 = np.asarray(a1, dtype=complex) + 0.0 * er[..., 0]
+        cc = np.asarray(cc, dtype=complex) + 0.0 * er[..., 0]
+        ex, ey = er[..., 0], er[..., 1]
+        px_, py_ = ep[..., 0], ep[..., 1]
+        a_rr = a0 * ex * ex + 2.0 * cc * ex * ey + a1 * ey * ey
+        a_rp = a0 * ex * px_ + cc * (ex * py_ + ey * px_) + a1 * ey * py_
+        a_pp = a0 * px_ * px_ + 2.0 * cc * px_ * py_ + a1 * py_ * py_
+        with np.errstate(all="ignore"):
+            a_eff = a_rr - a_rp ** 2 / np.where(np.abs(a_pp) < 1e-300, 1e-300, a_pp)
+            c_r = 1j * k * a_eff                    # = -jk*(物理 a), 见 (A.25.1)
+            c_p = 1j * k * a_pp
+            ok = (np.real(c_r) > 0.0) & (np.real(c_p) > 0.0)
+            ok &= np.isfinite(c_r) & np.isfinite(c_p)
+            sq = srep(np.where(ok, c_r, 1.0 + 0.0j))          # Re sqrt >= 0
+            Z = np.where(ok, sq * gm["d_r"], 0.0)
+            T_st = 0.5 * (1.0 + np.where(ok, erf(Z), 0.0))
+            s2 = 1.0 / np.where(ok, 2.0 * c_p, 1.0 + 0.0j)
+            lam = np.where(ok, sq * gm["kappa"] / 2.0, 0.0)
+            # m1 = 0 ⟹ M_2n = (2n-1)!! s2^n
+            acc = lam * s2                                     # n=1 项
+            if order >= 2:
+                M4 = 3.0 * s2 ** 2
+                acc = acc + lam ** 2 * (2.0 * Z) * M4 / 2.0    # H_1(Z) = 2Z
+            if order >= 3:
+                M6 = 15.0 * s2 ** 3
+                acc = acc + lam ** 3 * (4.0 * Z ** 2 - 2.0) * M6 / 6.0
+            S_ratio = np.where(ok, np.exp(-Z * Z) * acc / SQRTPI, 0.0)
+            S_ratio = np.where(np.isfinite(S_ratio), S_ratio, 0.0)
+        return {"S_ratio": S_ratio, "Z": Z, "T_straight": T_st, "d_r": gm["d_r"],
+                "kappa": gm["kappa"], "ok": ok}
+
+    # ---------- 附录 B: rho1=d 处的 phi1se ----------
+    def _edge_terms(self, S, phi, cache=None):
+        lm = self.lm
+        if cache is None:
+            cache = self._cache(S)
+        a0, a1, b0, b1, cc, xs, ys, fs, den = cache
         Xr, Yr, Xrp, Yrp = lm.edge_map(phi)
         x = lm.xo + lm.d * Xr
         y = lm.yo + lm.d * Yr
@@ -554,7 +755,7 @@ class ChouPathakSingle:
         return x, y, fx, fy, D, dD
 
     def phi1se_newton(self, S, phi_start=None, iters=80, tol=1e-14,
-                      max_step=0.3, verbose=False):
+                      max_step=0.3, verbose=False, cache=None):
         """数值解 (B6)(B7): g'_phi(phi1se)|_{rho1=d} = 0 (复 Newton + 阻尼线搜索 + 兜底)
 
         工程健壮性(GBMA 里每束都要解一次, 各种几何都可能遇到):
@@ -565,6 +766,8 @@ class ChouPathakSingle:
           * 迭代后仍非有限/未收敛的方向退回 phi = 0 (即"朝最近边缘"的方向)
         """
         S = np.asarray(S, dtype=float)
+        if cache is None:
+            cache = self._cache(S)
         NN = S.shape[:-1]
         if phi_start is None:
             phi = np.zeros(NN, dtype=complex)
@@ -574,7 +777,7 @@ class ChouPathakSingle:
         phi = np.where(np.isfinite(phi), phi, 0.0)
         with np.errstate(all="ignore"):
             for _ in range(iters):
-                x, y, fx, fy, D, dD = self._edge_terms(S, phi)
+                x, y, fx, fy, D, dD = self._edge_terms(S, phi, cache)
                 Dabs = np.abs(D)
                 good = np.isfinite(Dabs) & np.isfinite(dD) & (np.abs(dD) > 1e-300)
                 step = np.where(good, D / np.where(good, dD, 1.0), 0.0)
@@ -583,7 +786,7 @@ class ChouPathakSingle:
                 best_phi, best_D = phi, Dabs
                 for ls in range(5):
                     trial = phi - step * (0.5 ** ls)
-                    xt, yt, fxt, fyt, Dt, _ = self._edge_terms(S, trial)
+                    xt, yt, fxt, fyt, Dt, _ = self._edge_terms(S, trial, cache)
                     Dt = np.abs(Dt)
                     better = np.isfinite(Dt) & (Dt < best_D)
                     best_phi = np.where(better, trial, best_phi)
@@ -598,11 +801,12 @@ class ChouPathakSingle:
         phi = np.where(bad, 0.0 + 0.0j, phi)
         return phi
 
-    def phi1se_cubic(self, S):
+    def phi1se_cubic(self, S, cache=None):
         """论文附录 B 的闭式 (B14)-(B23): s = sin(phi1se) 满足三次方程"""
         lm = self.lm
-        a0, a1, b0, b1, cc = self.coeffs(S)
-        xs, ys, fs, den = self.stationary(S)
+        if cache is None:
+            cache = self._cache(S)
+        a0, a1, b0, b1, cc, xs, ys, fs, den = cache
         X = lm.xo - xs
         Y = lm.yo - ys
         A1, A2, B1, B2 = lm.A1, lm.A2c, lm.B1, lm.B2c
@@ -629,6 +833,149 @@ class ChouPathakSingle:
         z = np.take_along_axis(cand, idx[None, ...], axis=0)[0]
         return np.arcsin(np.asarray(z, dtype=complex))
 
+    def phi1se_quartic(self, S, tol=1e-8, cache=None):
+        """附录 B (B7) 的**精确**闭式解: 不取 (B13) 小角近似, 直接解四次方程
+
+        论文 L1051-1053 原话: "φ₁ₛe in (B7) can be found in closed form by replacing
+        cos φ₁ₛe with √(1−sin²φ₁ₛe) and then solving a quartic equation for sin φ₁ₛe at the
+        expense of some tedious algebra. However, a significant simplification ... if one
+        approximates √(1−sin²φ₁ₛe) for cos φ₁ₛe as [1−sin²/2] (B13)."
+        即: **四次**是论文说的 exact 路线, **三次**(`phi1se_cubic`) 是 (B13) 的近似产物,
+        后者要求 sin φ₁ₛe < 1/4. 这里实现四次, 从而**没有那个前提**.
+
+        (B7): H1 s² + H2 s c + H3 s + H4 c + H5 = 0
+        对 c 是线性的 ⟹ c = −P/Q, P = H1 s² + H3 s + H5, Q = H2 s + H4;
+        再代入 c² = 1 − s² ⟹ P² − (1−s²)Q² = 0 —— 关于 s 的四次方程:
+            (H1²+H2²)s⁴ + 2(H1H3+H2H4)s³ + (H3²+2H1H5−H2²+H4²)s²
+            + 2(H3H5−H2H4)s + (H5²−H4²) = 0
+        平方会引入 c=+P/Q 的**伪根**, 用 |s²+c²−1| < tol 剔除, 再取 |s| 最小的那个
+        (与三次解取 |sin| 最小根的口径一致 ⟹ 落在同一支上)。
+
+        返回 (phi, ok); ok=False 表示该点四次解不可用(需回退)。
+        """
+        lm = self.lm
+        if cache is None:
+            cache = self._cache(S)
+        a0, a1, b0, b1, cc, xs, ys, fs, den = cache
+        X = lm.xo - xs
+        Y = lm.yo - ys
+        A1, A2, B1, B2 = lm.A1, lm.A2c, lm.B1, lm.B2c
+        d = lm.d
+        H1 = 4.0 * d * (a0 * A1 * A2 + a1 * B1 * B2 + cc * (A2 * B1 + B2 * A1))       # (B8)
+        H2 = 2.0 * d * (a0 * (A1 ** 2 - A2 ** 2) + a1 * (B1 ** 2 - B2 ** 2)
+                        + 2.0 * cc * (A1 * B1 - A2 * B2))                             # (B9)
+        H3 = 2.0 * (a0 * A1 * X + a1 * B1 * Y + cc * (A1 * Y + B1 * X))               # (B10)
+        H4 = -2.0 * (a0 * A2 * X + a1 * B2 * Y + cc * (A2 * Y + B2 * X))              # (B11)
+        H5 = -0.5 * H1                                                                # (B12)
+        with np.errstate(all="ignore"):
+            qa = H1 ** 2 + H2 ** 2
+            qb = 2.0 * (H1 * H3 + H2 * H4)
+            qc = H3 ** 2 + 2.0 * H1 * H5 - H2 ** 2 + H4 ** 2
+            qd = 2.0 * (H3 * H5 - H2 * H4)
+            qe = H5 ** 2 - H4 ** 2
+            # 归一化(防止四次项系数是舍入噪声时把整条方程放大到 1e29 量级)
+            scale = np.maximum(np.maximum(np.maximum(np.abs(qa), np.abs(qb)),
+                                          np.maximum(np.abs(qc), np.abs(qd))), np.abs(qe))
+            scale = np.where(scale > 0.0, scale, 1.0)
+            # 四阶系数相对过小 ⟹ 方程退化(例: 束轴打在对称中心时 H1=H2=0),
+            # 这类点直接判无效, 由上层回退(退化情形任何 phi 都是解, 取 phi=0 或牛顿)
+            deg_ok = np.abs(qa) > 1e-8 * scale
+            roots = _quartic_all_roots(qa / scale, qb / scale, qc / scale,
+                                       qd / scale, qe / scale)
+            P = H1 * roots ** 2 + H3 * roots + H5
+            Q = H2 * roots + H4
+            okq = np.abs(Q) > 1e-300
+            C = np.where(okq, -P / np.where(okq, Q, 1.0), np.nan)
+            err = np.abs(roots ** 2 + C ** 2 - 1.0)          # 剔伪根 (c=+P/Q 那些)
+            ok = np.isfinite(err) & (err < tol)
+            # s -> phi: arcsin 只给 principal 支(c>0), 用 c=-P/Q 判断该取哪一支
+            phi0 = np.arcsin(np.asarray(roots, dtype=complex))
+            phi1 = np.pi - phi0                              # sin 相同、cos 反号
+            phi0 = np.where(np.abs(np.cos(phi1) - C) < np.abs(np.cos(phi0) - C), phi1, phi0)
+            # 把 Re(phi) 折回 (-pi, pi]
+            phi0 = np.where(np.real(phi0) > np.pi, phi0 - 2.0 * np.pi, phi0)
+            phi0 = np.where(np.real(phi0) < -np.pi, phi0 + 2.0 * np.pi, phi0)
+            ok = ok & deg_ok & np.isfinite(phi0)
+            # (B7) 有多个真根(它们都精确满足方程), 但**只有一支**对应"离 O 最近的那段
+            # 边缘", 选错根会让 (71)(72) 的过渡分支翻号 → P_d 变成垃圾(实测 +200 dB)。
+            # 三次解(B13 近似)虽然精度只有 1e-5 量级, 但它落在同一支上, 正好当"选根器":
+            # 四次解负责精度, 三次解负责分支。
+            pc = np.asarray(self.phi1se_cubic(S, cache), dtype=complex)
+            # 退化根: H1=0 ⟹ H5=0 ⟹ phi=0 本身满足 (B7)(此时任何 phi 都满足, 取对称解)。
+            # 这类点上四个四次根里往往没有 phi=0(Q -> 0 使 c=-P/Q 无意义), 必须显式补上,
+            # 否则会选到 |Im phi|~3 的远根(P_d 放大到 1e58)。
+            hscale = np.maximum(np.maximum(np.maximum(np.abs(H1), np.abs(H2)),
+                                           np.maximum(np.abs(H3), np.abs(H4))), np.abs(H5))
+            hscale = np.where(hscale > 0.0, hscale, 1.0)
+            zero_ok = np.abs(H5) <= 1e-10 * hscale
+            zcand = np.zeros_like(phi0[:1])
+            phi0 = np.concatenate([phi0, zcand], axis=0)
+            ok = np.concatenate([ok, np.broadcast_to(zero_ok[None, ...], zcand.shape)], axis=0)
+            score = np.where(ok, np.abs(phi0 - pc[None, ...]), np.inf)
+            j = np.argmin(score, axis=0)
+            phi = np.take_along_axis(phi0, j[None, ...], axis=0)[0]
+            ok = np.take_along_axis(ok, j[None, ...], axis=0)[0]
+        return phi, ok
+
+    # ---------- 统一入口(便于对比几种 phi1se 解法) ----------
+    def phi1se(self, S, mode="newton", cache=None):
+        """按 mode 求边缘点的 phi1se; 返回 phi(复数, 形状 = S.shape[:-1])
+
+        mode
+        ----
+        "newton"       : 阻尼牛顿解精确 (B7)               —— **默认**, 最稳
+        "cubic"        : 三次解(B13近似)做起初值 + 牛顿    —— 等价精度, 省几次迭代
+        "cubic_pure"   : 纯三次闭式, 无牛顿                —— 有 (B13) 前提, 快但可能错
+        "quartic_pure" : 纯四次闭式(无 B13、无牛顿)        —— 坏点退回 phi=0
+        "closed"       : 四次闭式; 坏点依次回退 三次 → 牛顿 —— 快且稳(推荐对比用)
+        """
+        S = np.asarray(S, dtype=float)
+        if cache is None:
+            cache = self._cache(S)
+        self.phi_mode_info = {"mode": mode, "n": int(np.prod(S.shape[:-1])),
+                              "n_cubic_fallback": 0, "n_newton_fallback": 0, "n_bad": 0}
+        if mode == "newton":
+            return self.phi1se_newton(S, cache=cache)
+        if mode == "cubic":
+            return self.phi1se_newton(S, phi_start=self.phi1se_cubic(S, cache), cache=cache)
+        if mode == "cubic_pure":
+            phi = np.asarray(self.phi1se_cubic(S, cache), dtype=complex)
+        elif mode in ("quartic_pure", "closed"):
+            phi, ok = self.phi1se_quartic(S, cache=cache)
+            if mode == "closed" and not np.all(ok):
+                # 四次解不可用的点(退化/伪根)直接交给牛顿, **不能**用三次解兜底:
+                # 三次解即使数值有限也可能是错的, 而边缘相位一旦错, (71)(72) 的
+                # 过渡分支就会把 P_d 放大成垃圾(实测纯三次解会让方向图 +250 dB).
+                self.phi_mode_info["n_newton_fallback"] = int(np.sum(~ok))
+                Sf = S.reshape(-1, 3)
+                mask = (~ok).ravel()
+                flat = np.asarray(phi, dtype=complex).ravel().copy()
+                flat[mask] = self._newton_subset(Sf, mask, cache)
+                phi = flat.reshape(np.shape(phi))
+                ok = np.ones_like(ok)
+        else:
+            raise ValueError(f"phi1se mode 只能是 newton/cubic/cubic_pure/quartic_pure/closed, "
+                             f"收到 {mode!r}")
+        bad = (~np.isfinite(phi) | (np.abs(np.imag(phi)) > 3.0)
+               | (np.abs(np.real(phi)) > np.pi))
+        if np.any(bad):
+            self.phi_mode_info["n_bad"] = int(np.sum(bad))
+            if mode == "closed":                       # 最后兜底: 牛顿
+                self.phi_mode_info["n_newton_fallback"] = int(np.sum(bad))
+                phi = np.where(bad, self.phi1se_newton(S), phi)
+            else:                                      # 纯闭式: 退回 phi=0
+                phi = np.where(bad, 0.0, phi)
+        return phi
+
+    def _newton_subset(self, S_flat, mask, cache):
+        """只对 mask 选中的方向跑牛顿（其它方向的结果不动，省时间）。
+
+        cache 只对应整体方向集，所以这里按子集重算一次 cache。
+        """
+        sub = self.phi1se_newton(S_flat[mask])
+        return sub
+
+
     # ---------- 边缘点 Q 解冻 ----------
     def edge_q_correction(self, x, y):
         """把 (73) 边缘点的二次相位从 Q(0) 换成局部 Q(z_i):
@@ -650,8 +997,9 @@ class ChouPathakSingle:
         """返回 P^s = r*E^s*exp(+jkr) 及各中间量"""
         lm = self.lm
         S = np.asarray(S, dtype=float)
-        a0, a1, b0, b1, cc = self.coeffs(S)
-        xs, ys, fs, den = self.stationary(S)
+        # 与 φ 无关的 9 个量只算一次, 供 phi1se 求解/_edge_terms/gpp_rho 共用 (A.20.1)
+        cache = self._cache(S)
+        a0, a1, b0, b1, cc, xs, ys, fs, den = cache
 
         # ---- (68) 反射场 ----
         Fs = self.fbar(xs, ys, S)
@@ -660,11 +1008,8 @@ class ChouPathakSingle:
         Pr = (-np.pi / (w1 * w2))[..., None] * Fs * np.exp(1j * self.k * fs)[..., None]
 
         # ---- 附录 B: 边缘量 (B1)(B3)(B5) ----
-        if phi1se_mode == "cubic":
-            phi = self.phi1se_newton(S, phi_start=self.phi1se_cubic(S))
-        else:
-            phi = self.phi1se_newton(S)
-        x_e, y_e, fx_e, fy_e, D_e, _ = self._edge_terms(S, phi)
+        phi = self.phi1se(S, phi1se_mode, cache=cache)
+        x_e, y_e, fx_e, fy_e, D_e, _ = self._edge_terms(S, phi, cache)
         Xr, Yr, Xrp, Yrp = lm.edge_map(phi)
         gpd = fx_e * Xr + fy_e * Yr                                                   # (B3)
         xd = lm.d * Xrp                # dx/dphi1  at rho1 = d
@@ -739,8 +1084,58 @@ class ChouPathakSingle:
         wgt = wgt * wgt * (3.0 - 2.0 * wgt)                     # smoothstep
         wgt = np.where(np.isfinite(Ps).all(axis=-1), wgt, 0.0)  # 字面式非有限处直接退回稳定式
         Ps_auto = (wgt[..., None] * Ps + (1.0 - wgt[..., None]) * Ps_stable)
+
+        # ---- 纯解析路径 (REPORT A.27) --------------------------------------
+        #   P_analytic = P_r · [ T_straight − S_ratio ]
+        #     T_straight = ½[1+erf(Z)],  Z = √c_eff·d_r   （直边, 只用实几何距离）
+        #     S_ratio    = erf 展开 + 复高斯精确取矩      （月牙/曲边, 初等闭式项）
+        # 三块都是初等闭式：反射本体 P_r 是二次型 SPP，直边是 erf 解析式，
+        # 月牙是一串初等项。**整条链不含任何复根求解**，也不需要窗/上限——
+        # 因为 Z 只用实几何 d_r，Re Z 与 d_r 同号，T_straight 单调 (0,1) 有界。
+        # 关掉时 Ps_analytic ≡ Ps_stable（逐位相同），方便一次跑出 A/B。
+        if self.edge_crescent:
+            cr = self.crescent_ratio(S, cache=cache)
+            S_ratio_raw = cr["S_ratio"]
+            T_analytic = cr["T_straight"] - S_ratio_raw
+            Ps_analytic = Pr * T_analytic[..., None]
+            bad = ~np.isfinite(Ps_analytic).all(axis=-1)
+            if np.any(bad):
+                Ps_analytic = np.where(bad[..., None], Ps_stable, Ps_analytic)
+
+            # ---- 嫁接式(仅对照，**不是**推荐路径)：把 S_ratio 加到现有的 fall 上 ----
+            # 现有 fall=½[1+erf(S_a)] 里的 S_a 来自 (B7) 的复根，|Z| 大时它会随 Im S_a
+            # 指数增长(不再是截断因子)，所以这里只能加窗+上限才安全。A.27 记录了它的表现。
+            zt = np.abs(cr["Z"])
+            win = np.clip(2.0 - zt, 0.0, 1.0)
+            win = win * win * (3.0 - 2.0 * win)          # smoothstep: |Z|<=1 全用, >=2 关闭
+            S_ratio_w = S_ratio_raw * win
+            lim = 0.5 * np.maximum(np.abs(fall), 1e-12)
+            mag = np.abs(S_ratio_w)
+            S_ratio_w = S_ratio_w * np.minimum(1.0, lim / np.maximum(mag, 1e-30))
+            T_crescent = fall - S_ratio_w
+            Ps_crescent = Pr * T_crescent[..., None]
+            bad = ~np.isfinite(Ps_crescent).all(axis=-1)
+            if np.any(bad):
+                Ps_crescent = np.where(bad[..., None], Ps_stable, Ps_crescent)
+            S_ratio = S_ratio_raw
+            cr_d, cr_k = cr["d_r"], cr["kappa"]
+            cr_ok = cr["ok"]
+        else:
+            S_ratio = np.zeros_like(fall, dtype=complex)
+            T_crescent = fall
+            Ps_crescent = Ps_stable
+            T_analytic = fall
+            Ps_analytic = Ps_stable
+            cr_d = np.zeros_like(fall, dtype=float)
+            cr_k = np.zeros_like(fall, dtype=float)
+            cr_ok = np.zeros(np.shape(fall), dtype=bool)
+
         return {
             "Ps": Ps, "Ps_stable": Ps_stable, "Ps_auto": Ps_auto,
+            "Ps_crescent": Ps_crescent, "Ps_analytic": Ps_analytic,
+            "T_analytic": T_analytic, "S_ratio": S_ratio,
+            "T_crescent": T_crescent, "d_r": cr_d, "kappa_rim": cr_k,
+            "crescent_ok": int(np.count_nonzero(cr_ok)),
             "Pr": Pr, "Pd": Pd, "T": T, "Sa": Sa, "w_auto": wgt,
             "n_clip": n_clip, "n_near": n_near,
             "im_Sa_max": float(np.max(np.abs(np.imag(Sa)))),
@@ -750,6 +1145,140 @@ class ChouPathakSingle:
             "gpp_rho": gpp_rho, "f_se": f_se, "x_e": x_e, "y_e": y_e,
             "Fbar_s": Fs, "Fbar_e": Fe,
         }
+
+
+# --------------------------------------------------------------------------- #
+# 纯解析路径 (REPORT A.27)
+# --------------------------------------------------------------------------- #
+class ChouPathakAnalytic:
+    """chou1997 反射的**纯解析路径**：三块全是初等闭式，不含任何复根求解。
+
+        反射本体   P_r = (-pi/(w1 w2)) F_s e^{jk f_s}          ← 二次型 SPP，初等
+        直边截断   T_st = ½[1+erf(Z)],
+                   Z = sqrt(c_eff) d_r - jk b_eff/(2 sqrt(c_eff))   ← 含 erf 的解析式
+        月牙修正   S_ratio = e^{-Z²} sum_n λ^n H_{n-1}(Z) M_{2n}/n!  ← 初等项
+        T = T_st - S_ratio,  P = P_r · T
+
+    与 `ChouPathakSingle` 相比，边缘点**不靠 (B7)/(B13) 的复根求 φ₁ₛ**：
+    - (a_ξξ, a_ξη, a_ηη)、(b_ξ, b_η) 是 f 在局部系里的二次/线性系数，
+      旋到 (e_r, e_φ) 后做 Schur 补：  c_eff = jk(a_ξξ - a_ξη²/a_ηη)，
+                                      b_eff = b_ξ - a_ξη b_η/a_ηη；
+    - d_r, κ 是**每束一次**的实几何量（原点 = 束的反射点 = 光斑中心），
+      不随观察方向变；方向依赖全部由 b = S - S_spec 承担（S_spec = 镜面方向 = C 的第 3 行）。
+    - 实测(REPORT A.27)：这个闭式 Z 与四次解出的 S_a 在 0~30° 上**量级逐位相等**
+      （1°: 0.550/0.550 … 30°: 1.16e14/1.16e14），只差一个整体共轭（相位约定）。
+
+    因此 T 仍会随 |Im Z| 指数增长——这不是病态，而是它抵消 P_r 的束斑衰减、
+    承载宽角绕射能量的方式。
+
+    参数
+    ----
+    conjugate : 取 Z 的共轭（相位约定二选一，用端到端 PO 对拍定，见 A.27）
+    order     : 月牙级数阶数（实测 1 与 2 逐位相同）
+    """
+
+    def __init__(self, lm, beam, k=None, order=1, conjugate=False):
+        self.spp = ChouPathakSingle(lm, beam, k=k)
+        self.lm = self.spp.lm
+        self.beam = self.spp.beam
+        self.k = self.spp.k
+        self.order = int(order)
+        self.conjugate = bool(conjugate)
+        self._setup()
+
+    # ---- 每束一次的实几何 + 解析系数 ----
+    def _setup(self):
+        spp, lm = self.spp, self.lm
+        self.Sspec = np.asarray(spp.c[2], dtype=float)        # (c31,c32,c33) 镜面方向(局部)
+        self.ok = bool(np.isfinite(lm.d) and lm.d > 0.0
+                       and not bool(getattr(lm, "d_imag", False)))
+        if not self.ok:
+            self.d_r, self.kappa = 0.0, 0.0
+            self.e_r = np.array([1.0, 0.0])
+            self.e_p = np.array([0.0, 1.0])
+            self.a_frozen = (0j, 0j, 0j)
+            self.c_eff0 = 1.0 + 0.0j
+            self.a_pp0 = 1.0 + 0.0j
+            self.lam0 = 0.0j
+            return
+        a0, a1, b0, b1, cc = spp.coeffs(self.Sspec)           # 镜面方向: b0=b1=0
+        self.a_frozen = (complex(a0), complex(a1), complex(cc))
+        gm = spp.rim_nearest(0.0, 0.0)                        # 原点 = 束的反射点
+        self.d_r = float(np.real(gm["d_r"]))
+        self.kappa = float(np.real(gm["kappa"]))
+        self.e_r = np.asarray(gm["er"], dtype=float).reshape(-1)[:2]
+        self.e_p = np.asarray(gm["ep"], dtype=float).reshape(-1)[:2]
+        a_rr, a_rp, a_pp = self._rotate(self.a_frozen)
+        self.a_pp0 = complex(a_pp)
+        self.c_eff0 = 1j * self.k * (a_rr - a_rp ** 2 / a_pp)
+
+    def _rotate(self, a):
+        """二次型 (a0,a1,cc) 旋到 (e_r,e_φ)"""
+        a0, a1, cc = a
+        ex, ey = self.e_r
+        px_, py_ = self.e_p
+        a_rr = a0 * ex * ex + 2.0 * cc * ex * ey + a1 * ey * ey
+        a_rp = a0 * ex * px_ + cc * (ex * py_ + ey * px_) + a1 * ey * py_
+        a_pp = a0 * px_ * px_ + 2.0 * cc * px_ * py_ + a1 * py_ * py_
+        return a_rr, a_rp, a_pp
+
+    # ---- 每方向: 反射本体 + 直边 + 月牙 ----
+    def Ps(self, S):
+        S = np.atleast_2d(np.asarray(S, dtype=float))
+        spp, k = self.spp, self.k
+        cache = spp._cache(S)
+        a0, a1, b0, b1, cc, xs, ys, fs, den = cache
+
+        # (1) 反射本体: 鞍点处二次型的 SPP —— 初等闭式
+        with np.errstate(all="ignore"):
+            Fs = spp.fbar(xs, ys, S)
+            w1 = spim(-1j * k * a1)
+            w2 = spim(-1j * k * (den / a1))
+            Pr = (-np.pi / (w1 * w2))[..., None] * Fs * np.exp(1j * k * fs)[..., None]
+
+        if not self.ok:
+            T = np.ones(np.shape(np.asarray(xs)))
+            Z = np.zeros(np.shape(T), dtype=complex)
+            S_ratio = np.zeros(np.shape(T), dtype=complex)
+        else:
+            # (2) 直边: Z = sqrt(c_eff) d_r - jk b_eff / (2 sqrt(c_eff))
+            a_rr, a_rp, a_pp = self._rotate((a0, a1, cc))
+            c_eff = 1j * k * (a_rr - a_rp ** 2 / a_pp)
+            sq = srep(c_eff)                                  # Re sqrt >= 0
+            b_r = b0 * self.e_r[0] + b1 * self.e_r[1]
+            b_p = b0 * self.e_p[0] + b1 * self.e_p[1]
+            b_eff = b_r - a_rp * b_p / a_pp
+            with np.errstate(all="ignore"):
+                Z = sq * self.d_r - 1j * k * b_eff / (2.0 * sq)
+            if self.conjugate:
+                Z = np.conj(Z)
+            T_st = 0.5 * (1.0 + erf(Z))
+            # (3) 月牙: erf 展开 + 复高斯精确取矩（初等项）
+            c_p = 1j * k * a_pp
+            lam = sq * self.kappa / 2.0
+            s2 = 1.0 / (2.0 * c_p)
+            acc = lam * s2
+            if self.order >= 2:
+                acc = acc + lam ** 2 * (2.0 * Z) * (3.0 * s2 ** 2) / 2.0
+            if self.order >= 3:
+                acc = acc + lam ** 3 * (4.0 * Z ** 2 - 2.0) * (15.0 * s2 ** 3) / 6.0
+            with np.errstate(all="ignore"):
+                S_ratio = np.exp(-Z * Z) * acc / SQRTPI
+            S_ratio = np.where(np.isfinite(S_ratio), S_ratio, 0.0)
+            T = T_st - S_ratio
+            T = np.where(np.isfinite(T), T, T_st)
+
+        P = Pr * T[..., None]
+        bad = ~np.isfinite(P).all(axis=-1)
+        if np.any(bad):
+            P = np.where(bad[..., None], 0.0, P)
+        return {"Ps": P, "Ps_stable": P, "Ps_auto": P, "Ps_crescent": P,
+                "Ps_analytic": P, "Pr": Pr, "T": T, "T_analytic": T,
+                "T_crescent": T, "S_ratio": S_ratio, "Sa": Z, "Z": Z,
+                "d_r": np.full(np.shape(np.real(np.asarray(xs))), self.d_r),
+                "kappa_rim": np.full(np.shape(np.real(np.asarray(xs))), self.kappa),
+                "n_clip": 0, "n_near": 0, "n_transition": 0,
+                "phi1se": None, "P_r": Pr}
 
 
 # --------------------------------------------------------------------------- #
